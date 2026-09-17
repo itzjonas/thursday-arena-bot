@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         Thursday Arena Smart Bot (Pro Edition)
-// @namespace    http://tampermonkey.net/
-// @version      4.0
+// @namespace    https://github.com/itzjonas/thursday-arena-bot
+// @version      4.0.1
 // @description  Advanced heuristic auto-player with smart carry targeting, auto-sell upgrades, economy management, and interactive HUD.
+// @author       itzjonas
 // @match        https://thursdayarena.com/match*
+// @updateURL    https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
+// @downloadURL  https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
 // @grant        none
 // ==/UserScript==
 
@@ -42,7 +45,7 @@
 
         overlay.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 6px;">
-                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.0</span>
+                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.0.1</span>
                 <button id="ta-toggle-pause" style="
                     background: ${CONFIG.paused ? '#dc2626' : '#16a34a'}; color: white; border: none;
                     padding: 3px 8px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 10px;
@@ -253,9 +256,6 @@
         }
 
         // 6. Strategic Reroll
-        // Only reroll if:
-        // - We have surplus gold (>= 4 gold means we can reroll 1 and still afford a 3-cost unit/food)
-        // - OR we have 1 gold left (burning spare gold that can't afford a unit anyway)
         if (state.buttons.reroll && state.gold > 0) {
             const shouldReroll = !CONFIG.econSmartReroll || state.gold >= 4 || state.gold === 1;
             if (shouldReroll) {

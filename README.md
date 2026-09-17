@@ -1,21 +1,37 @@
-# Thursday Arena Smart Bot
+# Thursday Arena Smart Bot (Pro Edition)
 
-A Tampermonkey userscript for [Thursday Arena](https://thursdayarena.com) featuring an automated heuristic player and a real-time on-screen debug overlay.
+A Tampermonkey userscript for [Thursday Arena](https://thursdayarena.com) featuring an automated heuristic auto-player, real-time on-screen HUD, carry-scaling strategy, and auto-upgrade selling.
 
-## Features
+[![Install Userscript](https://img.shields.io/badge/Tampermonkey-Install%20Script-brightgreen?style=for-the-badge&logo=tampermonkey)](https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js)
 
-- **Live HUD / Debug Overlay**: Displays bot state (status, current phase, gold, board unit count, shop unit/food counts, and last executed action) directly in the bottom-left corner.
-- **Smart Shop Phase Automation**:
-  - Automatically buys and fills up board slots with the highest combined stat units (ATK + HP).
-  - Automatically feeds the frontline unit with food buffs when the board is full.
-  - Automatically rerolls the shop when surplus gold exists.
-  - Confirms unit purchases and transitions into combat when ready.
-- **Non-blocking Loop**: Configurable action delays and turn execution cycles.
+---
 
-## Installation
+## ⚡ One-Click Installation
 
-1. Install the [Tampermonkey](https://www.tampermonkey.net/) extension for Chrome/Firefox/Edge/Brave.
-2. In Tampermonkey, click **Create a new script**.
-3. Paste the contents of [`bot.user.js`](./bot.user.js) into the editor.
-4. Save the script (`Cmd+S` or `Ctrl+S`).
-5. Navigate to `https://thursdayarena.com/match` to start playing with the bot overlay active.
+1. Make sure you have the [Tampermonkey Extension](https://www.tampermonkey.net/) installed in your browser.
+2. Click here to install: **[👉 Direct 1-Click Install `bot.user.js`](https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js)**
+3. Tampermonkey will automatically open a tab prompting: **"Install Thursday Arena Smart Bot"**. Click **Install**.
+4. Navigate to [thursdayarena.com/match](https://thursdayarena.com/match). The HUD overlay will load automatically in the bottom-left corner.
+
+---
+
+## 🔄 Automatic Updates
+
+This script includes `@updateURL` and `@downloadURL` metadata headers:
+- Tampermonkey checks this repository periodically in the background for new versions.
+- Whenever a new version is pushed to GitHub, Tampermonkey will automatically update the script in your browser.
+- To check manually: Open the **Tampermonkey Dashboard** -> click the **Utilities** tab -> click **Check for userscript updates**.
+
+---
+
+## 🎮 Key Features
+
+- **Interactive In-Game HUD**:
+  - **Pause / Resume**: Toggle automation on/off with one click during play.
+  - **Strategy Selector**: Switch between:
+    - `Hyper-Carry (Top Stat)`: Funnels all food buffs into your strongest unit to snowball stats.
+    - `Backline Protected`: Buffs and protects the backline unit behind tanks.
+    - `Frontline Tank`: Stacks health on the front position.
+  - **Auto-Upgrade Selling**: Automatically sells the weakest unit when a shop unit provides at least +3 total stats.
+- **Smart Economy**: Avoids wasteful rerolls and preserves gold for unit purchases and food scaling.
+- **Visual Feedback**: Displays real-time game phase, gold, board slots, carry stats, and active actions.
