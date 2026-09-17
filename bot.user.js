@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thursday Arena Smart Bot (Pro Edition)
 // @namespace    https://github.com/itzjonas/thursday-arena-bot
-// @version      4.0.1
-// @description  Advanced heuristic auto-player with smart carry targeting, auto-sell upgrades, economy management, and interactive HUD.
+// @version      4.1.0
+// @description  Advanced heuristic auto-player with robust card targeting, two-step feeding, and HUD.
 // @author       itzjonas
 // @match        https://thursdayarena.com/match*
 // @updateURL    https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
@@ -13,20 +13,36 @@
 (function() {
     'use strict';
 
-    // --- BOT CONFIGURATION ---
+    // --- CONFIGURATION ---
     const CONFIG = {
-        actionDelay: 750,
-        loopInterval: 1800,
+        actionDelay: 850,
+        loopInterval: 2000,
         enableAutoSellUpgrade: true,
-        upgradeStatThreshold: 3, // Only sell if shop unit has at least +3 total stats over weakest board unit
+        upgradeStatThreshold: 3,
         carryStrategy: 'highest-stat', // 'highest-stat', 'backline', 'frontline'
-        econSmartReroll: true, // Don't burn gold down to 1 or 2 if we could buy next
+        econSmartReroll: true,
         paused: false
     };
 
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // --- INTERACTIVE OVERLAY SETUP ---
+    // --- SYNTHETIC CLICK HELPER ---
+    // Dispatches full pointer and mouse event sequence to ensure React/framework synthetic handlers fire
+    function triggerClick(element) {
+        if (!element) return;
+        const rect = element.getBoundingClientRect();
+        const clientX = rect.left + rect.width / 2;
+        const clientY = rect.top + rect.height / 2;
+        const eventInit = { bubbles: true, cancelable: true, view: window, clientX, clientY };
+
+        element.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+        element.dispatchEvent(new MouseEvent('mousedown', eventInit));
+        element.dispatchEvent(new PointerEvent('pointerup', eventInit));
+        element.dispatchEvent(new MouseEvent('mouseup', eventInit));
+        element.click();
+    }
+
+    // --- HUD OVERLAY ---
     const overlay = document.createElement('div');
     overlay.id = 'ta-bot-hud';
     overlay.style.cssText = `
@@ -45,7 +61,7 @@
 
         overlay.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 6px;">
-                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.0.1</span>
+                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.1.0</span>
                 <button id="ta-toggle-pause" style="
                     background: ${CONFIG.paused ? '#dc2626' : '#16a34a'}; color: white; border: none;
                     padding: 3px 8px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 10px;
@@ -82,13 +98,12 @@
             </div>
         `;
 
-        // Bind interactive handlers
         const pauseBtn = document.getElementById('ta-toggle-pause');
         if (pauseBtn) {
             pauseBtn.onclick = (e) => {
                 e.stopPropagation();
                 CONFIG.paused = !CONFIG.paused;
-                renderOverlay(state, CONFIG.paused ? "Paused by user" : "Resumed");
+                renderOverlay(state, CONFIG.paused ? "Paused" : "Resumed");
             };
         }
 
@@ -113,40 +128,82 @@
     // --- DOM HELPERS ---
     const getElByText = (selector, text) => {
         return Array.from(document.querySelectorAll(selector))
-            .find(el => el.textContent.toLowerCase().includes(text.toLowerCase()) && !el.disabled);
+            .find(el => el.textContent.trim().toLowerCase().includes(text.toLowerCase()) && !el.disabled);
     };
 
     const parseStats = (text) => {
-        const atkMatch = text.match(/ATK\s*(\d+)/i) || text.match(/(\d+)\s*⚔️/);
-        const hpMatch = text.match(/HP\s*(\d+)/i) || text.match(/(\d+)\s*❤️/);
-        const atk = atkMatch ? parseInt(atkMatch[1]) : 0;
-        const hp = hpMatch ? parseInt(hpMatch[1]) : 0;
+        const atkMatch = text.match(/ATK\s*(\d+)/i) || text.match(/(\d+)\s*⚔️/) || text.match(/ATK\n*(\d+)/i);
+        const hpMatch = text.match(/HP\s*(\d+)/i) || text.match(/(\d+)\s*❤️/) || text.match(/HP\n*(\d+)/i);
+        
+        let atk = atkMatch ? parseInt(atkMatch[1]) : 0;
+        let hp = hpMatch ? parseInt(hpMatch[1]) : 0;
+
+        // Fallback: search for numbers near ATK/HP if regex didn't catch due to formatting
+        if (atk === 0 || hp === 0) {
+            const rawNumbers = text.match(/\b\d+\b/g);
+            if (rawNumbers && rawNumbers.length >= 2) {
+                // Often the first two discrete numbers in a unit card are ATK and HP
+                if (atk === 0) atk = parseInt(rawNumbers[0]) || 0;
+                if (hp === 0) hp = parseInt(rawNumbers[1]) || 0;
+            }
+        }
+
         return { atk, hp, total: atk + hp };
     };
 
+    // Find the real board card element above a Sell button
+    function getCardElementForSellButton(sellBtn) {
+        // Look upwards for the column/container that holds both the unit card and the sell button
+        let current = sellBtn.parentElement;
+        for (let i = 0; i < 5 && current; i++) {
+            // Find any sibling or child card above the sell button
+            const candidate = current.querySelector('div[class*="card"], div[class*="unit"], div[style*="cursor"]');
+            if (candidate && candidate !== sellBtn) {
+                return candidate;
+            }
+            // If the element has substantial height and isn't just the button bar
+            if (current.offsetHeight > 100) {
+                return current;
+            }
+            current = current.parentElement;
+        }
+        return sellBtn.parentElement;
+    }
+
     // --- STATE PARSER ---
     function getGameState() {
-        const fightBtn = getElByText('button, div[role="button"]', 'fight round');
-        const buyBtn = getElByText('button, div[role="button"]', 'Buy');
-        const useBtn = getElByText('button, div[role="button"]', 'USE ON A BOT') || getElByText('button, div[role="button"]', 'FEED');
-        const rerollBtn = getElByText('button, div[role="button"]', 'Reroll');
+        const fightBtn = getElByText('button, div[role="button"]', 'fight');
+        const buyBtn = getElByText('button, div[role="button"]', 'buy');
+        const useBtn = getElByText('button, div[role="button"]', 'use on a bot') 
+            || getElByText('button, div[role="button"]', 'use 3g')
+            || getElByText('button, div[role="button"]', 'use')
+            || getElByText('button, div[role="button"]', 'feed');
+        const rerollBtn = getElByText('button, div[role="button"]', 'reroll');
         
+        // Extract gold count
         let gold = 0;
         const goldEl = getElByText('*', 'gold');
         if (goldEl) {
             const match = goldEl.textContent.match(/(\d+)\s*gold/i);
-            if (match) gold = parseInt(match[1]);
+            if (match) {
+                gold = parseInt(match[1]);
+            } else {
+                const nums = goldEl.textContent.match(/\d+/);
+                if (nums) gold = parseInt(nums[0]);
+            }
         }
 
-        // Board Parsing
-        const sellButtons = Array.from(document.querySelectorAll('button, div')).filter(el => el.textContent.trim() === 'Sell');
+        // Board Units (Look for "Sell" buttons in "YOUR LINE")
+        const sellButtons = Array.from(document.querySelectorAll('button, div[role="button"], div'))
+            .filter(el => el.textContent.trim() === 'Sell');
+
         const boardUnits = sellButtons.map((sellBtn, index) => {
-            const container = sellBtn.closest('div[class*="unit"], div[class*="card"], div') || sellBtn.parentElement;
-            const text = container ? container.textContent : '';
+            const cardElement = getCardElementForSellButton(sellBtn);
+            const text = cardElement ? cardElement.textContent : '';
             return {
                 index,
                 sellBtn,
-                container,
+                cardElement,
                 stats: parseStats(text)
             };
         });
@@ -159,22 +216,26 @@
             } else if (CONFIG.carryStrategy === 'backline') {
                 carryUnit = boardUnits[boardUnits.length - 1];
             } else {
-                // 'highest-stat' hyper carry
                 carryUnit = [...boardUnits].sort((a, b) => b.stats.total - a.stats.total)[0];
             }
         }
 
-        // Weakest unit on board for potential sell replacement
         const weakestUnit = boardUnits.length > 0 
             ? [...boardUnits].sort((a, b) => a.stats.total - b.stats.total)[0] 
             : null;
 
-        // Shop Parsing
+        // Shop Cards
         const allCards = Array.from(document.querySelectorAll('div'))
-            .filter(el => el.textContent.length > 15 && (el.textContent.includes('ATK') || el.textContent.includes('FOOD') || el.textContent.includes('🍎')));
+            .filter(el => el.textContent.length > 15 && (el.textContent.includes('ATK') || el.textContent.includes('FOOD') || el.textContent.includes('APPLE') || el.textContent.includes('🍎')));
         
-        const shopCardsRaw = allCards.filter(card => !card.textContent.includes('Sell') && !card.textContent.includes('YOUR LINE'));
-        const foodCards = shopCardsRaw.filter(c => c.textContent.includes('FOOD') || c.textContent.includes('🍎'));
+        const shopCardsRaw = allCards.filter(card => 
+            !card.textContent.includes('Sell') && 
+            !card.textContent.includes('YOUR LINE') &&
+            !card.textContent.includes('THEY TOOK') &&
+            !card.textContent.includes('AI • NO GHOST')
+        );
+
+        const foodCards = shopCardsRaw.filter(c => c.textContent.includes('FOOD') || c.textContent.includes('APPLE') || c.textContent.includes('🍎'));
         const unitCards = shopCardsRaw
             .filter(c => !foodCards.includes(c))
             .map(cardEl => ({ element: cardEl, stats: parseStats(cardEl.textContent) }))
@@ -196,61 +257,60 @@
     async function executeTurn() {
         const state = getGameState();
 
-        if (CONFIG.paused) {
-            return;
-        }
+        if (CONFIG.paused) return;
 
         if (!state.isShopPhase) {
-            renderOverlay(state, "Waiting for combat to conclude...");
+            renderOverlay(state, "Waiting for combat...");
             return;
         }
 
-        // 1. Confirm pending 'BUY' modal if open
+        // 1. If bottom "Use" button is active (e.g., 'Use 3g'), click it first, then tap the carry unit
+        const bottomUseBtn = getElByText('button, div[role="button"]', 'use 3g') || getElByText('button, div[role="button"]', 'use');
+        if (bottomUseBtn && state.carryUnit && state.gold >= 3) {
+            renderOverlay(state, `Clicking '${bottomUseBtn.textContent.trim()}'...`);
+            triggerClick(bottomUseBtn);
+            await sleep(500);
+
+            renderOverlay(state, `Tapping carry unit #${state.carryUnit.index + 1}...`);
+            triggerClick(state.carryUnit.cardElement);
+            await sleep(CONFIG.actionDelay);
+            return;
+        }
+
+        // 2. If a confirmation "Buy" button is visible
         if (state.buttons.buy && state.gold >= 3) {
-            renderOverlay(state, "Confirming purchase ('Buy')...");
-            state.buttons.buy.click();
+            renderOverlay(state, "Confirming purchase...");
+            triggerClick(state.buttons.buy);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 2. Feed the designated carry with food
-        if (state.buttons.use && state.carryUnit && state.gold >= 3) {
-            renderOverlay(state, `Feeding carry unit #${state.carryUnit.index + 1}...`);
-            state.buttons.use.click();
-            await sleep(400);
-            if (state.carryUnit.container) {
-                state.carryUnit.container.click();
-            }
-            await sleep(CONFIG.actionDelay);
-            return;
-        }
-
-        // 3. Fill empty board slots first (up to 3 units)
+        // 3. Fill open board slots (< 3 units)
         if (state.boardCount < 3 && state.gold >= 3 && state.shop.units.length > 0) {
             const bestUnit = state.shop.units[0];
-            renderOverlay(state, `Recruiting unit with ${bestUnit.stats.total} stats (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
-            bestUnit.element.click();
+            renderOverlay(state, `Recruiting ${bestUnit.stats.total} stat unit (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
+            triggerClick(bestUnit.element);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 4. Smart Upgrade: Sell weakest board unit if shop has a significantly superior unit
+        // 4. Auto-upgrade: Sell weakest unit if shop has a strictly superior unit
         if (CONFIG.enableAutoSellUpgrade && state.boardCount === 3 && state.gold >= 3 && state.shop.units.length > 0 && state.weakestUnit) {
             const bestShopUnit = state.shop.units[0];
             const statDifference = bestShopUnit.stats.total - state.weakestUnit.stats.total;
 
             if (statDifference >= CONFIG.upgradeStatThreshold) {
-                renderOverlay(state, `Selling unit #${state.weakestUnit.index + 1} (${state.weakestUnit.stats.total} stats) for shop unit (+${statDifference} stats)...`);
-                state.weakestUnit.sellBtn.click();
+                renderOverlay(state, `Replacing unit #${state.weakestUnit.index + 1} with +${statDifference} stat upgrade...`);
+                triggerClick(state.weakestUnit.sellBtn);
                 await sleep(CONFIG.actionDelay);
                 return;
             }
         }
 
-        // 5. Board is full: Prioritize buying food buffs for the carry
+        // 5. Board is full: Select Food item to trigger feed flow
         if (state.boardCount === 3 && state.gold >= 3 && state.shop.food.length > 0) {
-            renderOverlay(state, `Buffing carry: Selecting food item...`);
-            state.shop.food[0].click();
+            renderOverlay(state, `Selecting food item to buff carry...`);
+            triggerClick(state.shop.food[0]);
             await sleep(CONFIG.actionDelay);
             return;
         }
@@ -259,17 +319,17 @@
         if (state.buttons.reroll && state.gold > 0) {
             const shouldReroll = !CONFIG.econSmartReroll || state.gold >= 4 || state.gold === 1;
             if (shouldReroll) {
-                renderOverlay(state, `Rolling shop for upgrades (Gold: ${state.gold})...`);
-                state.buttons.reroll.click();
+                renderOverlay(state, `Rolling shop for better options (Gold: ${state.gold})...`);
+                triggerClick(state.buttons.reroll);
                 await sleep(CONFIG.actionDelay);
                 return;
             }
         }
 
-        // 7. All actions complete: Start Fight
+        // 7. Ready for battle
         if (state.buttons.fight) {
-            renderOverlay(state, "Board optimal. Starting combat!");
-            state.buttons.fight.click();
+            renderOverlay(state, "Ready. Starting fight!");
+            triggerClick(state.buttons.fight);
         }
     }
 
@@ -279,7 +339,7 @@
         boardCount: 0,
         carryUnit: null,
         shop: { units: [], food: [] }
-    }, "Initializing Strategic Engine...");
+    }, "Bot v4.1.0 Initialized");
 
     setInterval(async () => {
         try {
