@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thursday Arena Smart Bot (Pro Edition)
 // @namespace    https://github.com/itzjonas/thursday-arena-bot
-// @version      4.2.0
-// @description  Advanced heuristic auto-player with robust leaf-target clicker, discrete feed-state handler, and in-game HUD.
+// @version      4.3.0
+// @description  Advanced heuristic auto-player with instant combat skip/2X, auto-continue round transitions, and smart shop automation.
 // @author       itzjonas
 // @match        https://thursdayarena.com/match*
 // @updateURL    https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
@@ -15,12 +15,15 @@
 
     // --- CONFIGURATION ---
     const CONFIG = {
-        actionDelay: 750,
-        loopInterval: 1800,
+        actionDelay: 700,
+        loopInterval: 1500,
+        combatPollInterval: 350, // Fast poll during combat to hit 2X/Skip/Continue instantly
         enableAutoSellUpgrade: true,
         upgradeStatThreshold: 3,
         carryStrategy: 'highest-stat', // 'highest-stat', 'backline', 'frontline'
         econSmartReroll: true,
+        autoFastForward: true,
+        autoContinue: true,
         paused: false
     };
 
@@ -60,7 +63,7 @@
 
         overlay.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 6px;">
-                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.2.0</span>
+                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.3.0</span>
                 <button id="ta-toggle-pause" style="
                     background: ${CONFIG.paused ? '#dc2626' : '#16a34a'}; color: white; border: none;
                     padding: 3px 8px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 10px;
@@ -68,7 +71,7 @@
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 8px;">
                 <div><span style="color:#94a3b8;">Status:</span> <strong style="color:${CONFIG.paused ? '#f87171' : '#4ade80'};">${CONFIG.paused ? 'PAUSED' : 'ACTIVE'}</strong></div>
-                <div><span style="color:#94a3b8;">Phase:</span> <strong style="color:white;">${state.isShopPhase ? 'Shop' : 'Combat'}</strong></div>
+                <div><span style="color:#94a3b8;">Phase:</span> <strong style="color:white;">${state.isShopPhase ? 'Shop' : 'Combat / End'}</strong></div>
                 <div><span style="color:#94a3b8;">Gold:</span> <strong style="color:#facc15;">${state.gold}</strong></div>
                 <div><span style="color:#94a3b8;">Board:</span> <strong style="color:white;">${state.boardCount}/3</strong></div>
                 <div><span style="color:#94a3b8;">Carry Unit:</span> <strong style="color:#a855f7;">${carryLabel}</strong></div>
@@ -87,8 +90,10 @@
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <span style="color:#94a3b8; font-size:10px;">Auto-Upgrade:</span>
                     <button id="ta-toggle-upgrade" style="background:${CONFIG.enableAutoSellUpgrade ? '#0284c7' : '#475569'}; color:white; border:none; border-radius:3px; font-size:9px; padding:2px 6px; cursor:pointer;">
-                        ${CONFIG.enableAutoSellUpgrade ? 'ON (+3 Stat Min)' : 'OFF'}
+                        ${CONFIG.enableAutoSellUpgrade ? 'ON (+3 Min)' : 'OFF'}
                     </button>
+                    <span style="color:#94a3b8; font-size:10px; margin-left: 8px;">Fast 2X/Skip:</span>
+                    <strong style="color:#38bdf8; font-size:9px;">ON</strong>
                 </div>
             </div>
 
@@ -127,7 +132,11 @@
     // --- DOM HELPERS ---
     const getElByText = (selector, text) => {
         return Array.from(document.querySelectorAll(selector))
-            .find(el => el.textContent.trim().toLowerCase().includes(text.toLowerCase()) && !el.disabled);
+            .find(el => {
+                if (el.closest('#ta-bot-hud')) return false;
+                const t = el.textContent.trim().toLowerCase();
+                return t.includes(text.toLowerCase()) && !el.disabled;
+            });
     };
 
     const parseStats = (text) => {
@@ -148,7 +157,6 @@
         return { atk, hp, total: atk + hp };
     };
 
-    // Find the real board card element above a Sell button
     function getCardElementForSellButton(sellBtn) {
         let current = sellBtn.parentElement;
         for (let i = 0; i < 5 && current; i++) {
@@ -164,29 +172,89 @@
         return sellBtn.parentElement;
     }
 
+    // --- COMBAT & TRANSITION HANDLER ---
+    function checkCombatTransitions() {
+        if (CONFIG.paused) return false;
+
+        // 1. Check for "Continue" / "Next Round" / "Play Again" button
+        const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], a')).find(el => {
+            if (el.closest('#ta-bot-hud')) return false;
+            const t = el.textContent.trim().toLowerCase();
+            return (
+                t === 'continue' ||
+                t.startsWith('continue') ||
+                t === 'next' ||
+                t === 'next round' ||
+                t.includes('next round') ||
+                t === 'play again' ||
+                t === 'go to shop'
+            ) && el.offsetParent !== null && !el.disabled;
+        });
+
+        if (continueBtn) {
+            triggerClick(continueBtn);
+            return 'continue';
+        }
+
+        // 2. Check for "2X", "Fast", "Speed", or "Skip" button during combat
+        const speedBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, span')).find(el => {
+            if (el.closest('#ta-bot-hud')) return false;
+            const t = el.textContent.trim().toLowerCase();
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            const isMatch = (
+                t === '2x' ||
+                t === 'skip' ||
+                t === 'fast' ||
+                t === '>>' ||
+                t.includes('skip round') ||
+                t.includes('skip battle') ||
+                t.includes('2x speed') ||
+                aria.includes('skip') ||
+                aria.includes('2x') ||
+                aria.includes('speed')
+            );
+            return isMatch && el.offsetParent !== null && !el.disabled;
+        });
+
+        if (speedBtn) {
+            // Only click if it's not already pressed/active (avoid toggle loop)
+            const isAlreadyActive = speedBtn.classList.contains('active') || 
+                                    speedBtn.getAttribute('aria-pressed') === 'true';
+            if (!isAlreadyActive) {
+                triggerClick(speedBtn);
+                return 'speed';
+            }
+        }
+
+        return false;
+    }
+
     // --- STATE PARSER ---
     function getGameState() {
         const fightBtn = getElByText('button, div[role="button"]', 'fight');
         
-        // Find bottom action buttons
         const actionButtons = Array.from(document.querySelectorAll('button, div[role="button"]'));
         const buyBtn = actionButtons.find(b => {
+            if (b.closest('#ta-bot-hud')) return false;
             const t = b.textContent.trim().toLowerCase();
             return (t.includes('buy') || t.startsWith('buy')) && !b.disabled;
         });
         const useBtn = actionButtons.find(b => {
+            if (b.closest('#ta-bot-hud')) return false;
             const t = b.textContent.trim().toLowerCase();
             return (t.includes('use') || t.startsWith('use')) && !b.disabled && !t.includes('use on a bot');
         });
-        const rerollBtn = actionButtons.find(b => b.textContent.trim().toLowerCase().includes('reroll') && !b.disabled);
+        const rerollBtn = actionButtons.find(b => {
+            if (b.closest('#ta-bot-hud')) return false;
+            return b.textContent.trim().toLowerCase().includes('reroll') && !b.disabled;
+        });
 
-        // Feed buttons currently rendered over board units
+        // Visible FEED overlay buttons on units
         const feedLeafButtons = Array.from(document.querySelectorAll('*')).filter(el => {
             if (el.closest('#ta-bot-hud')) return false;
             return el.children.length === 0 && el.textContent.trim().toUpperCase() === 'FEED' && el.offsetParent !== null;
         });
 
-        // Extract gold count
         let gold = 0;
         const goldEl = getElByText('*', 'gold');
         if (goldEl) {
@@ -199,9 +267,8 @@
             }
         }
 
-        // Board Units (Sell buttons in "YOUR LINE")
         const sellButtons = Array.from(document.querySelectorAll('button, div[role="button"], div'))
-            .filter(el => el.textContent.trim() === 'Sell');
+            .filter(el => !el.closest('#ta-bot-hud') && el.textContent.trim() === 'Sell');
 
         const boardUnits = sellButtons.map((sellBtn, index) => {
             const cardElement = getCardElementForSellButton(sellBtn);
@@ -214,7 +281,6 @@
             };
         });
 
-        // Determine designated carry unit
         let carryUnit = null;
         if (boardUnits.length > 0) {
             if (CONFIG.carryStrategy === 'frontline') {
@@ -230,9 +296,8 @@
             ? [...boardUnits].sort((a, b) => a.stats.total - b.stats.total)[0] 
             : null;
 
-        // Shop Cards
         const allCards = Array.from(document.querySelectorAll('div'))
-            .filter(el => el.textContent.length > 15 && (el.textContent.includes('ATK') || el.textContent.includes('FOOD') || el.textContent.includes('APPLE') || el.textContent.includes('🍎')));
+            .filter(el => !el.closest('#ta-bot-hud') && el.textContent.length > 15 && (el.textContent.includes('ATK') || el.textContent.includes('FOOD') || el.textContent.includes('APPLE') || el.textContent.includes('🍎')));
         
         const shopCardsRaw = allCards.filter(card => 
             !card.textContent.includes('Sell') && 
@@ -262,16 +327,29 @@
 
     // --- STRATEGIC ENGINE ---
     async function executeTurn() {
-        const state = getGameState();
-
         if (CONFIG.paused) return;
 
-        if (!state.isShopPhase) {
-            renderOverlay(state, "Waiting for combat...");
+        // 1. Check for Skip/2X and Continue transitions first
+        const transition = checkCombatTransitions();
+        if (transition === 'continue') {
+            renderOverlay(getGameState(), "Round concluded! Clicking 'Continue'...");
+            await sleep(CONFIG.actionDelay);
+            return;
+        } else if (transition === 'speed') {
+            renderOverlay(getGameState(), "Speeding up combat: Clicked '2X / Skip'...");
+            await sleep(400);
             return;
         }
 
-        // 1. If FEED target buttons are active on the board, click the carry unit's FEED button!
+        const state = getGameState();
+
+        // 2. If not shop phase, wait for combat to finish
+        if (!state.isShopPhase) {
+            renderOverlay(state, "Combat in progress (monitoring 2X / Skip / Continue)...");
+            return;
+        }
+
+        // 3. If FEED target buttons are active on the board, click the carry's FEED button
         if (state.feedLeafButtons.length > 0) {
             const targetIdx = state.carryUnit ? state.carryUnit.index : 0;
             const targetBtn = state.feedLeafButtons[targetIdx] || state.feedLeafButtons[0];
@@ -282,7 +360,7 @@
             return;
         }
 
-        // 2. If the bottom action button is 'Use 3g' / 'Use', click it to enter FEED targeting mode
+        // 4. If bottom action button is 'Use 3g' / 'Use', click to enter FEED targeting mode
         if (state.buttons.use && state.gold >= 3) {
             renderOverlay(state, `Clicking '${state.buttons.use.textContent.trim()}' to enter feed mode...`);
             triggerClick(state.buttons.use);
@@ -290,7 +368,7 @@
             return;
         }
 
-        // 3. If a bottom 'Buy' / 'Buy 3g' button is visible, click to confirm unit purchase
+        // 5. If bottom 'Buy' / 'Buy 3g' button is visible, click to confirm unit purchase
         if (state.buttons.buy && state.gold >= 3) {
             renderOverlay(state, `Confirming purchase: Clicking '${state.buttons.buy.textContent.trim()}'...`);
             triggerClick(state.buttons.buy);
@@ -298,16 +376,16 @@
             return;
         }
 
-        // 4. Fill open board slots (< 3 units)
+        // 6. Fill open board slots (< 3 units)
         if (state.boardCount < 3 && state.gold >= 3 && state.shop.units.length > 0) {
             const bestUnit = state.shop.units[0];
-            renderOverlay(state, `Selecting ${bestUnit.stats.total} stat unit in shop (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
+            renderOverlay(state, `Recruiting ${bestUnit.stats.total} stat unit in shop (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
             triggerClick(bestUnit.element);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 5. Auto-upgrade: Sell weakest unit if shop offers >= +3 stat upgrade
+        // 7. Auto-upgrade: Sell weakest unit if shop offers >= +3 stat upgrade
         if (CONFIG.enableAutoSellUpgrade && state.boardCount === 3 && state.gold >= 3 && state.shop.units.length > 0 && state.weakestUnit) {
             const bestShopUnit = state.shop.units[0];
             const statDifference = bestShopUnit.stats.total - state.weakestUnit.stats.total;
@@ -320,18 +398,17 @@
             }
         }
 
-        // 6. Board is full: Select Food item to prepare feed flow
+        // 8. Board is full: Select Food item to prepare feed flow
         if (state.boardCount === 3 && state.gold >= 3 && state.shop.food.length > 0) {
             renderOverlay(state, `Selecting food card in shop...`);
             const foodCard = state.shop.food[0];
-            // If inner 'USE ON A BOT' button exists, click it; else click the food card
             const innerBtn = Array.from(foodCard.querySelectorAll('*')).find(el => el.textContent.trim().toUpperCase() === 'USE ON A BOT');
             triggerClick(innerBtn || foodCard);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 7. Strategic Reroll
+        // 9. Strategic Reroll
         if (state.buttons.reroll && state.gold > 0) {
             const shouldReroll = !CONFIG.econSmartReroll || state.gold >= 4 || state.gold === 1;
             if (shouldReroll) {
@@ -342,10 +419,11 @@
             }
         }
 
-        // 8. Ready for battle
+        // 10. Ready for battle: Start Fight
         if (state.buttons.fight) {
-            renderOverlay(state, "Board ready. Starting fight!");
+            renderOverlay(state, "Board optimal. Starting combat!");
             triggerClick(state.buttons.fight);
+            await sleep(CONFIG.actionDelay);
         }
     }
 
@@ -355,8 +433,9 @@
         boardCount: 0,
         carryUnit: null,
         shop: { units: [], food: [] }
-    }, "Bot v4.2.0 Initialized");
+    }, "Bot v4.3.0 Initialized");
 
+    // Main turn loop
     setInterval(async () => {
         try {
             await executeTurn();
@@ -365,5 +444,14 @@
             renderOverlay(getGameState(), `Error: ${error.message}`);
         }
     }, CONFIG.loopInterval);
+
+    // Fast combat monitor: poll every 350ms to instantly hit Skip, 2X, or Continue
+    setInterval(() => {
+        try {
+            checkCombatTransitions();
+        } catch (e) {
+            // Ignore background transition errors
+        }
+    }, CONFIG.combatPollInterval);
 
 })();
