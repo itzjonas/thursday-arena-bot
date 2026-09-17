@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Thursday Arena Smart Bot (Pro Edition)
 // @namespace    https://github.com/itzjonas/thursday-arena-bot
-// @version      4.3.0
-// @description  Advanced heuristic auto-player with instant combat skip/2X, auto-continue round transitions, and smart shop automation.
+// @version      4.4.0
+// @description  Fully autonomous auto-battler: instant combat 2X/skip, auto-advance rounds, auto-queue "Play Again" on victory/defeat, and smart carry scaling.
 // @author       itzjonas
-// @match        https://thursdayarena.com/match*
+// @match        https://thursdayarena.com/*
 // @updateURL    https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
 // @downloadURL  https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
 // @grant        none
@@ -17,14 +17,20 @@
     const CONFIG = {
         actionDelay: 700,
         loopInterval: 1500,
-        combatPollInterval: 350, // Fast poll during combat to hit 2X/Skip/Continue instantly
+        combatPollInterval: 300, // Fast 300ms poll for 2X/Skip/Continue/Play Again
         enableAutoSellUpgrade: true,
         upgradeStatThreshold: 3,
         carryStrategy: 'highest-stat', // 'highest-stat', 'backline', 'frontline'
         econSmartReroll: true,
         autoFastForward: true,
         autoContinue: true,
+        autoPlayAgain: true,
         paused: false
+    };
+
+    // Session Stats
+    const STATS = {
+        matchesPlayed: 0
     };
 
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -63,7 +69,7 @@
 
         overlay.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 6px;">
-                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.3.0</span>
+                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.4.0</span>
                 <button id="ta-toggle-pause" style="
                     background: ${CONFIG.paused ? '#dc2626' : '#16a34a'}; color: white; border: none;
                     padding: 3px 8px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 10px;
@@ -92,8 +98,8 @@
                     <button id="ta-toggle-upgrade" style="background:${CONFIG.enableAutoSellUpgrade ? '#0284c7' : '#475569'}; color:white; border:none; border-radius:3px; font-size:9px; padding:2px 6px; cursor:pointer;">
                         ${CONFIG.enableAutoSellUpgrade ? 'ON (+3 Min)' : 'OFF'}
                     </button>
-                    <span style="color:#94a3b8; font-size:10px; margin-left: 8px;">Fast 2X/Skip:</span>
-                    <strong style="color:#38bdf8; font-size:9px;">ON</strong>
+                    <span style="color:#94a3b8; font-size:10px; margin-left: 6px;">Play Again:</span>
+                    <strong style="color:#4ade80; font-size:9px;">ON</strong>
                 </div>
             </div>
 
@@ -172,57 +178,77 @@
         return sellBtn.parentElement;
     }
 
-    // --- COMBAT & TRANSITION HANDLER ---
+    // --- COMBAT, ROUND END & MATCH END TRANSITION HANDLER ---
     function checkCombatTransitions() {
         if (CONFIG.paused) return false;
 
-        // 1. Check for "Continue" / "Next Round" / "Play Again" button
-        const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], a')).find(el => {
-            if (el.closest('#ta-bot-hud')) return false;
-            const t = el.textContent.trim().toLowerCase();
-            return (
-                t === 'continue' ||
-                t.startsWith('continue') ||
-                t === 'next' ||
-                t === 'next round' ||
-                t.includes('next round') ||
-                t === 'play again' ||
-                t === 'go to shop'
-            ) && el.offsetParent !== null && !el.disabled;
-        });
+        // 1. Check for "Play Again", "Rematch", "New Match" (Match Completed / Victory / Defeat)
+        if (CONFIG.autoPlayAgain) {
+            const playAgainBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, div')).find(el => {
+                if (el.closest('#ta-bot-hud')) return false;
+                const t = el.textContent.trim().toLowerCase();
+                const isMatch = (
+                    (t === 'play again' || t.includes('play again') || t === 'rematch' || t.includes('new match')) &&
+                    t.length < 35
+                );
+                return isMatch && el.offsetParent !== null && !el.disabled;
+            });
 
-        if (continueBtn) {
-            triggerClick(continueBtn);
-            return 'continue';
+            if (playAgainBtn) {
+                STATS.matchesPlayed++;
+                triggerClick(playAgainBtn);
+                if (playAgainBtn.firstElementChild) triggerClick(playAgainBtn.firstElementChild);
+                return 'play-again';
+            }
         }
 
-        // 2. Check for "2X", "Fast", "Speed", or "Skip" button during combat
-        const speedBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, span')).find(el => {
-            if (el.closest('#ta-bot-hud')) return false;
-            const t = el.textContent.trim().toLowerCase();
-            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-            const isMatch = (
-                t === '2x' ||
-                t === 'skip' ||
-                t === 'fast' ||
-                t === '>>' ||
-                t.includes('skip round') ||
-                t.includes('skip battle') ||
-                t.includes('2x speed') ||
-                aria.includes('skip') ||
-                aria.includes('2x') ||
-                aria.includes('speed')
-            );
-            return isMatch && el.offsetParent !== null && !el.disabled;
-        });
+        // 2. Check for round end "Continue" / "Next Round"
+        if (CONFIG.autoContinue) {
+            const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, div')).find(el => {
+                if (el.closest('#ta-bot-hud')) return false;
+                const t = el.textContent.trim().toLowerCase();
+                const isMatch = (
+                    (t === 'continue' || t.startsWith('continue') || t === 'next round' || t.includes('next round') || t === 'go to shop') &&
+                    t.length < 30
+                );
+                return isMatch && el.offsetParent !== null && !el.disabled;
+            });
 
-        if (speedBtn) {
-            // Only click if it's not already pressed/active (avoid toggle loop)
-            const isAlreadyActive = speedBtn.classList.contains('active') || 
-                                    speedBtn.getAttribute('aria-pressed') === 'true';
-            if (!isAlreadyActive) {
-                triggerClick(speedBtn);
-                return 'speed';
+            if (continueBtn) {
+                triggerClick(continueBtn);
+                if (continueBtn.firstElementChild) triggerClick(continueBtn.firstElementChild);
+                return 'continue';
+            }
+        }
+
+        // 3. Check for "2X", "Fast", "Speed", or "Skip" button during active combat
+        if (CONFIG.autoFastForward) {
+            const speedBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, span')).find(el => {
+                if (el.closest('#ta-bot-hud')) return false;
+                const t = el.textContent.trim().toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const isMatch = (
+                    t === '2x' ||
+                    t === 'skip' ||
+                    t === 'fast' ||
+                    t === '>>' ||
+                    t.includes('skip round') ||
+                    t.includes('skip battle') ||
+                    t.includes('2x speed') ||
+                    aria.includes('skip') ||
+                    aria.includes('2x') ||
+                    aria.includes('speed')
+                );
+                return isMatch && el.offsetParent !== null && !el.disabled;
+            });
+
+            if (speedBtn) {
+                const isAlreadyActive = speedBtn.classList.contains('active') || 
+                                        speedBtn.getAttribute('aria-pressed') === 'true';
+                if (!isAlreadyActive) {
+                    triggerClick(speedBtn);
+                    return 'speed';
+                }
             }
         }
 
@@ -329,23 +355,27 @@
     async function executeTurn() {
         if (CONFIG.paused) return;
 
-        // 1. Check for Skip/2X and Continue transitions first
+        // 1. Check for Play Again, Continue, or Speed transitions
         const transition = checkCombatTransitions();
-        if (transition === 'continue') {
-            renderOverlay(getGameState(), "Round concluded! Clicking 'Continue'...");
+        if (transition === 'play-again') {
+            renderOverlay(getGameState(), "Match concluded! Starting new game ('Play Again')...");
+            await sleep(CONFIG.actionDelay);
+            return;
+        } else if (transition === 'continue') {
+            renderOverlay(getGameState(), "Round concluded! Advancing to next round ('Continue')...");
             await sleep(CONFIG.actionDelay);
             return;
         } else if (transition === 'speed') {
-            renderOverlay(getGameState(), "Speeding up combat: Clicked '2X / Skip'...");
-            await sleep(400);
+            renderOverlay(getGameState(), "Accelerating combat: Clicked '2X / Skip'...");
+            await sleep(350);
             return;
         }
 
         const state = getGameState();
 
-        // 2. If not shop phase, wait for combat to finish
+        // 2. If not shop phase, monitor combat/completion
         if (!state.isShopPhase) {
-            renderOverlay(state, "Combat in progress (monitoring 2X / Skip / Continue)...");
+            renderOverlay(state, "In battle / transition (monitoring 2X, Continue, Play Again)...");
             return;
         }
 
@@ -433,7 +463,7 @@
         boardCount: 0,
         carryUnit: null,
         shop: { units: [], food: [] }
-    }, "Bot v4.3.0 Initialized");
+    }, "Bot v4.4.0 Initialized");
 
     // Main turn loop
     setInterval(async () => {
@@ -445,7 +475,7 @@
         }
     }, CONFIG.loopInterval);
 
-    // Fast combat monitor: poll every 350ms to instantly hit Skip, 2X, or Continue
+    // High-frequency monitor (300ms) for instant 2X, Skip, Continue, and Play Again
     setInterval(() => {
         try {
             checkCombatTransitions();
