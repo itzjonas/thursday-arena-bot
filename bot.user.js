@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Thursday Arena Smart Bot (Pro Edition)
 // @namespace    https://github.com/itzjonas/thursday-arena-bot
-// @version      4.4.0
-// @description  Fully autonomous auto-battler: instant combat 2X/skip, auto-advance rounds, auto-queue "Play Again" on victory/defeat, and smart carry scaling.
+// @version      4.5.0
+// @description  Full auto-battler with in-line network sniffer (Fetch/XHR/WS), instant combat 2X/skip, round transitions, auto Play Again, and carry scaling.
 // @author       itzjonas
 // @match        https://thursdayarena.com/*
 // @updateURL    https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
 // @downloadURL  https://raw.githubusercontent.com/itzjonas/thursday-arena-bot/main/bot.user.js
 // @grant        none
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
@@ -17,7 +18,7 @@
     const CONFIG = {
         actionDelay: 700,
         loopInterval: 1500,
-        combatPollInterval: 300, // Fast 300ms poll for 2X/Skip/Continue/Play Again
+        combatPollInterval: 300,
         enableAutoSellUpgrade: true,
         upgradeStatThreshold: 3,
         carryStrategy: 'highest-stat', // 'highest-stat', 'backline', 'frontline'
@@ -25,15 +26,106 @@
         autoFastForward: true,
         autoContinue: true,
         autoPlayAgain: true,
+        logNetworkToConsole: true,
         paused: false
     };
 
-    // Session Stats
-    const STATS = {
-        matchesPlayed: 0
+    // Captured API Traffic Storage
+    const NETWORK_LOGS = [];
+    const MAX_LOGS = 15;
+
+    function recordNetworkTraffic(type, url, reqData, resData) {
+        // Filter out static assets, fonts, css, images
+        if (typeof url === 'string') {
+            if (url.match(/\.(png|jpg|jpeg|gif|svg|woff2?|ttf|css|ico)(\?.*)?$/i)) return;
+            if (url.includes('google-analytics') || url.includes('clarity') || url.includes('mixpanel')) return;
+        }
+
+        const logEntry = {
+            time: new Date().toLocaleTimeString(),
+            type,
+            url: typeof url === 'string' ? url.split('?')[0] : 'WS',
+            fullUrl: url,
+            req: reqData,
+            res: resData
+        };
+
+        NETWORK_LOGS.unshift(logEntry);
+        if (NETWORK_LOGS.length > MAX_LOGS) NETWORK_LOGS.pop();
+
+        if (CONFIG.logNetworkToConsole) {
+            console.log(`%c[TA-API] [${type}] ${url}`, 'color: #38bdf8; font-weight: bold;', {
+                request: reqData,
+                response: resData
+            });
+        }
+        updateNetworkDisplay();
+    }
+
+    // --- NETWORK INTERCEPTION (FETCH & XHR & WS) ---
+    // Intercept window.fetch
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const [resource, config] = args;
+        const url = typeof resource === 'string' ? resource : resource?.url;
+        let reqBody = null;
+        try {
+            if (config && config.body) {
+                reqBody = typeof config.body === 'string' ? JSON.parse(config.body) : config.body;
+            }
+        } catch (_) {
+            reqBody = config?.body;
+        }
+
+        try {
+            const response = await originalFetch.apply(this, args);
+            const clone = response.clone();
+            clone.text().then(text => {
+                let resBody = text;
+                try {
+                    resBody = JSON.parse(text);
+                } catch (_) {}
+                recordNetworkTraffic('FETCH', url, reqBody, resBody);
+            }).catch(() => {});
+            return response;
+        } catch (err) {
+            recordNetworkTraffic('FETCH-ERR', url, reqBody, err.message);
+            throw err;
+        }
     };
 
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    // Intercept XMLHttpRequest
+    const originalXHR = window.XMLHttpRequest;
+    function CustomXHR() {
+        const xhr = new originalXHR();
+        let method = 'GET';
+        let url = '';
+        let postData = null;
+
+        const origOpen = xhr.open;
+        xhr.open = function(m, u, ...rest) {
+            method = m;
+            url = u;
+            return origOpen.call(this, m, u, ...rest);
+        };
+
+        const origSend = xhr.send;
+        xhr.send = function(data) {
+            postData = data;
+            return origSend.call(this, data);
+        };
+
+        xhr.addEventListener('load', function() {
+            let res = xhr.responseText;
+            try { res = JSON.parse(res); } catch (_) {}
+            let req = postData;
+            try { req = JSON.parse(req); } catch (_) {}
+            recordNetworkTraffic(`XHR-${method}`, url, req, res);
+        });
+
+        return xhr;
+    }
+    window.XMLHttpRequest = CustomXHR;
 
     // --- SYNTHETIC CLICK HELPER ---
     function triggerClick(element) {
@@ -50,26 +142,59 @@
         element.click();
     }
 
-    // --- HUD OVERLAY ---
-    const overlay = document.createElement('div');
-    overlay.id = 'ta-bot-hud';
-    overlay.style.cssText = `
-        position: fixed; bottom: 12px; left: 12px; width: 320px;
-        background: rgba(12, 16, 24, 0.94); color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 11px; padding: 14px; border-radius: 8px; z-index: 999999;
-        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7); border: 1px solid rgba(56, 189, 248, 0.35);
-        backdrop-filter: blur(8px); line-height: 1.5; user-select: none;
-    `;
-    document.body.appendChild(overlay);
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // --- HUD OVERLAY SETUP ---
+    let overlay = null;
+    let netDrawer = null;
+
+    function initOverlay() {
+        if (overlay || !document.body) return;
+
+        overlay = document.createElement('div');
+        overlay.id = 'ta-bot-hud';
+        overlay.style.cssText = `
+            position: fixed; bottom: 12px; left: 12px; width: 330px;
+            background: rgba(12, 16, 24, 0.94); color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 11px; padding: 14px; border-radius: 8px; z-index: 999999;
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7); border: 1px solid rgba(56, 189, 248, 0.35);
+            backdrop-filter: blur(8px); line-height: 1.5; user-select: none;
+        `;
+
+        document.body.appendChild(overlay);
+    }
+
+    function updateNetworkDisplay() {
+        const netList = document.getElementById('ta-net-list');
+        if (!netList) return;
+
+        if (NETWORK_LOGS.length === 0) {
+            netList.innerHTML = '<span style="color:#64748b;">Awaiting game requests...</span>';
+            return;
+        }
+
+        netList.innerHTML = NETWORK_LOGS.slice(0, 4).map(l => {
+            const shortUrl = l.url.replace(/^https?:\/\/[^\/]+/, '');
+            return `
+                <div style="margin-bottom: 3px; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                    <span style="color:#38bdf8; font-weight: bold;">[${l.type}]</span>
+                    <span style="color:#e2e8f0;" title="${l.fullUrl}">${shortUrl || l.url}</span>
+                </div>
+            `;
+        }).join('');
+    }
 
     function renderOverlay(state, actionText) {
+        initOverlay();
+        if (!overlay) return;
+
         const carryLabel = state.carryUnit 
             ? `#${state.carryUnit.index + 1} (${state.carryUnit.stats.atk}/${state.carryUnit.stats.hp})`
             : 'None';
 
         overlay.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 6px;">
-                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.4.0</span>
+                <span style="font-weight: 700; color: #38bdf8; font-size: 12px;">⚔️ THURSDAY ARENA BOT v4.5.0</span>
                 <button id="ta-toggle-pause" style="
                     background: ${CONFIG.paused ? '#dc2626' : '#16a34a'}; color: white; border: none;
                     padding: 3px 8px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 10px;
@@ -103,10 +228,21 @@
                 </div>
             </div>
 
+            <!-- API Traffic Monitor -->
+            <div style="background: rgba(15, 23, 42, 0.9); border: 1px solid #1e293b; border-radius: 4px; padding: 6px; margin-bottom: 8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; border-bottom: 1px solid #334155; padding-bottom: 3px;">
+                    <span style="color:#38bdf8; font-weight:bold; font-size:10px;">📡 API Payload Sniffer</span>
+                    <span style="color:#64748b; font-size:9px;">Logs in Console</span>
+                </div>
+                <div id="ta-net-list" style="max-height: 60px; overflow: hidden; font-family: monospace;"></div>
+            </div>
+
             <div style="font-size: 11px; color: #cbd5e1; border-top: 1px dashed #334155; padding-top: 6px;">
                 <span style="color:#fbbf24;">Action:</span> <span style="color:#f1f5f9;">${actionText}</span>
             </div>
         `;
+
+        updateNetworkDisplay();
 
         const pauseBtn = document.getElementById('ta-toggle-pause');
         if (pauseBtn) {
@@ -178,11 +314,11 @@
         return sellBtn.parentElement;
     }
 
-    // --- COMBAT, ROUND END & MATCH END TRANSITION HANDLER ---
+    // --- COMBAT, ROUND END & MATCH END TRANSITIONS ---
     function checkCombatTransitions() {
         if (CONFIG.paused) return false;
 
-        // 1. Check for "Play Again", "Rematch", "New Match" (Match Completed / Victory / Defeat)
+        // 1. Play Again on victory / defeat
         if (CONFIG.autoPlayAgain) {
             const playAgainBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, div')).find(el => {
                 if (el.closest('#ta-bot-hud')) return false;
@@ -195,14 +331,13 @@
             });
 
             if (playAgainBtn) {
-                STATS.matchesPlayed++;
                 triggerClick(playAgainBtn);
                 if (playAgainBtn.firstElementChild) triggerClick(playAgainBtn.firstElementChild);
                 return 'play-again';
             }
         }
 
-        // 2. Check for round end "Continue" / "Next Round"
+        // 2. Round End Continue
         if (CONFIG.autoContinue) {
             const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, div')).find(el => {
                 if (el.closest('#ta-bot-hud')) return false;
@@ -221,7 +356,7 @@
             }
         }
 
-        // 3. Check for "2X", "Fast", "Speed", or "Skip" button during active combat
+        // 3. Fast Forward / Skip during combat
         if (CONFIG.autoFastForward) {
             const speedBtn = Array.from(document.querySelectorAll('button, div[role="button"], a, span')).find(el => {
                 if (el.closest('#ta-bot-hud')) return false;
@@ -255,7 +390,7 @@
         return false;
     }
 
-    // --- STATE PARSER ---
+    // --- GAME STATE PARSER ---
     function getGameState() {
         const fightBtn = getElByText('button, div[role="button"]', 'fight');
         
@@ -275,7 +410,6 @@
             return b.textContent.trim().toLowerCase().includes('reroll') && !b.disabled;
         });
 
-        // Visible FEED overlay buttons on units
         const feedLeafButtons = Array.from(document.querySelectorAll('*')).filter(el => {
             if (el.closest('#ta-bot-hud')) return false;
             return el.children.length === 0 && el.textContent.trim().toUpperCase() === 'FEED' && el.offsetParent !== null;
@@ -355,50 +489,48 @@
     async function executeTurn() {
         if (CONFIG.paused) return;
 
-        // 1. Check for Play Again, Continue, or Speed transitions
         const transition = checkCombatTransitions();
         if (transition === 'play-again') {
-            renderOverlay(getGameState(), "Match concluded! Starting new game ('Play Again')...");
+            renderOverlay(getGameState(), "Match finished! Starting next match ('Play Again')...");
             await sleep(CONFIG.actionDelay);
             return;
         } else if (transition === 'continue') {
-            renderOverlay(getGameState(), "Round concluded! Advancing to next round ('Continue')...");
+            renderOverlay(getGameState(), "Round concluded! Clicking 'Continue'...");
             await sleep(CONFIG.actionDelay);
             return;
         } else if (transition === 'speed') {
-            renderOverlay(getGameState(), "Accelerating combat: Clicked '2X / Skip'...");
+            renderOverlay(getGameState(), "Accelerating battle: Clicked '2X / Skip'...");
             await sleep(350);
             return;
         }
 
         const state = getGameState();
 
-        // 2. If not shop phase, monitor combat/completion
         if (!state.isShopPhase) {
-            renderOverlay(state, "In battle / transition (monitoring 2X, Continue, Play Again)...");
+            renderOverlay(state, "In battle / transition...");
             return;
         }
 
-        // 3. If FEED target buttons are active on the board, click the carry's FEED button
+        // 1. If FEED target buttons are active on the board, click the carry's FEED button
         if (state.feedLeafButtons.length > 0) {
             const targetIdx = state.carryUnit ? state.carryUnit.index : 0;
             const targetBtn = state.feedLeafButtons[targetIdx] || state.feedLeafButtons[0];
-            renderOverlay(state, `Feed targeting active: Clicking 'FEED' on carry #${targetIdx + 1}...`);
+            renderOverlay(state, `Feed targeting: Clicking 'FEED' on carry #${targetIdx + 1}...`);
             triggerClick(targetBtn);
             if (targetBtn.parentElement) triggerClick(targetBtn.parentElement);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 4. If bottom action button is 'Use 3g' / 'Use', click to enter FEED targeting mode
+        // 2. Click bottom 'Use 3g' / 'Use' to enter feed mode
         if (state.buttons.use && state.gold >= 3) {
-            renderOverlay(state, `Clicking '${state.buttons.use.textContent.trim()}' to enter feed mode...`);
+            renderOverlay(state, `Clicking '${state.buttons.use.textContent.trim()}' to feed...`);
             triggerClick(state.buttons.use);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 5. If bottom 'Buy' / 'Buy 3g' button is visible, click to confirm unit purchase
+        // 3. Click 'Buy' to confirm unit purchase
         if (state.buttons.buy && state.gold >= 3) {
             renderOverlay(state, `Confirming purchase: Clicking '${state.buttons.buy.textContent.trim()}'...`);
             triggerClick(state.buttons.buy);
@@ -406,16 +538,16 @@
             return;
         }
 
-        // 6. Fill open board slots (< 3 units)
+        // 4. Fill open board slots (< 3 units)
         if (state.boardCount < 3 && state.gold >= 3 && state.shop.units.length > 0) {
             const bestUnit = state.shop.units[0];
-            renderOverlay(state, `Recruiting ${bestUnit.stats.total} stat unit in shop (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
+            renderOverlay(state, `Recruiting ${bestUnit.stats.total} stat unit (${bestUnit.stats.atk}/${bestUnit.stats.hp})...`);
             triggerClick(bestUnit.element);
             await sleep(CONFIG.actionDelay);
             return;
         }
 
-        // 7. Auto-upgrade: Sell weakest unit if shop offers >= +3 stat upgrade
+        // 5. Auto-upgrade: Sell weakest unit if shop offers >= +3 stat upgrade
         if (CONFIG.enableAutoSellUpgrade && state.boardCount === 3 && state.gold >= 3 && state.shop.units.length > 0 && state.weakestUnit) {
             const bestShopUnit = state.shop.units[0];
             const statDifference = bestShopUnit.stats.total - state.weakestUnit.stats.total;
@@ -428,7 +560,7 @@
             }
         }
 
-        // 8. Board is full: Select Food item to prepare feed flow
+        // 6. Board is full: Select Food item to prepare feed flow
         if (state.boardCount === 3 && state.gold >= 3 && state.shop.food.length > 0) {
             renderOverlay(state, `Selecting food card in shop...`);
             const foodCard = state.shop.food[0];
@@ -438,7 +570,7 @@
             return;
         }
 
-        // 9. Strategic Reroll
+        // 7. Strategic Reroll
         if (state.buttons.reroll && state.gold > 0) {
             const shouldReroll = !CONFIG.econSmartReroll || state.gold >= 4 || state.gold === 1;
             if (shouldReroll) {
@@ -449,7 +581,7 @@
             }
         }
 
-        // 10. Ready for battle: Start Fight
+        // 8. Ready for battle: Start Fight
         if (state.buttons.fight) {
             renderOverlay(state, "Board optimal. Starting combat!");
             triggerClick(state.buttons.fight);
@@ -457,13 +589,19 @@
         }
     }
 
-    renderOverlay({
-        isShopPhase: false,
-        gold: 0,
-        boardCount: 0,
-        carryUnit: null,
-        shop: { units: [], food: [] }
-    }, "Bot v4.4.0 Initialized");
+    // Wait for document body to mount overlay
+    const checkDomReady = setInterval(() => {
+        if (document.body) {
+            clearInterval(checkDomReady);
+            renderOverlay({
+                isShopPhase: false,
+                gold: 0,
+                boardCount: 0,
+                carryUnit: null,
+                shop: { units: [], food: [] }
+            }, "Bot v4.5.0 Initialized with API Sniffer");
+        }
+    }, 100);
 
     // Main turn loop
     setInterval(async () => {
@@ -475,13 +613,11 @@
         }
     }, CONFIG.loopInterval);
 
-    // High-frequency monitor (300ms) for instant 2X, Skip, Continue, and Play Again
+    // Fast transition poll
     setInterval(() => {
         try {
             checkCombatTransitions();
-        } catch (e) {
-            // Ignore background transition errors
-        }
+        } catch (_) {}
     }, CONFIG.combatPollInterval);
 
 })();
